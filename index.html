@@ -95,7 +95,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'DM San
 .field-row.drag-over{border-top:2px solid var(--accent)}
 .drag-handle{color:var(--dim);cursor:grab;font-size:13px;padding:0 3px;flex-shrink:0;user-select:none}
 .drag-handle:active{cursor:grabbing}
-.ph-tag{background:var(--s2);border:1px solid var(--border);border-radius:3px;padding:3px 7px;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--accent);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px;flex-shrink:0}
+.ph-tag{background:var(--s2);border:1px solid var(--border);border-radius:3px;padding:3px 7px;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--accent);white-space:nowrap;flex-shrink:0}
 .ph-tag.partner{color:var(--accent2)}
 .ph-tag.other{color:var(--amber)}
 .field-input{background:var(--s2);border:1px solid var(--border);outline:none;color:var(--text);font-family:'DM Sans',sans-serif;font-size:12px;padding:5px 8px;border-radius:4px;flex:1;min-width:0;transition:.1s}
@@ -853,24 +853,70 @@ async function mergeDocx(buffer, values) {
 }
 
 // ── XLSX merge ────────────────────────────────────────────────────
+// Try to parse a value as a clean number (strip $, commas, %, spaces)
+function toNumeric(str) {
+  const cleaned = String(str).trim().replace(/[$,\s]/g, '').replace(/%$/, '');
+  if (cleaned === '' || cleaned === '-') return null;
+  const n = Number(cleaned);
+  return isFinite(n) ? n : null;
+}
+
 async function mergeXlsx(buffer, values) {
   const zip = await JSZip.loadAsync(buffer);
 
-  // shared strings
+  // Build a numeric-aware values map
+  // For shared strings we always use text; for inline sheet cells we try numeric
   const ssFile = zip.file('xl/sharedStrings.xml');
   if (ssFile) {
+    // Shared strings are always text — just replace as text
     const xml = await ssFile.async('string');
     zip.file('xl/sharedStrings.xml', replacePlaceholders(xml, values));
   }
 
-  // sheets
+  // For worksheet XML, replace placeholder cells with proper numeric cells where possible
   for (const fname of Object.keys(zip.files)) {
     if (fname.match(/xl\/worksheets\/sheet\d+\.xml/)) {
-      const xml = await zip.file(fname).async('string');
-      zip.file(fname, replacePlaceholders(xml, values));
+      let xml = await zip.file(fname).async('string');
+      xml = replaceXlsxCells(xml, values);
+      zip.file(fname, xml);
     }
   }
   return zip.generateAsync({type:'arraybuffer'});
+}
+
+// Replace placeholders in worksheet XML.
+// If a cell contains ONLY a placeholder and the value is numeric,
+// rewrite the cell as a proper number cell (no t="s" or t="inlineStr").
+function replaceXlsxCells(xml, values) {
+  // Handle inline string cells: <c r="A1" t="inlineStr"><is><t>{{key}}</t></is></c>
+  xml = xml.replace(
+    /<c([^>]*?)t="inlineStr"([^>]*)><is><t>\{\{([^}]+)\}\}<\/t><\/is><\/c>/g,
+    (match, pre, post, key) => {
+      if (!(key in values)) return match;
+      const num = toNumeric(values[key]);
+      if (num !== null) {
+        return `<c${pre}${post}><v>${num}</v></c>`;
+      }
+      return `<c${pre}t="inlineStr"${post}><is><t>${escapeXml(values[key])}</t></is></c>`;
+    }
+  );
+
+  // Handle shared-string cells that somehow still have placeholder text inline
+  // (some Excel files inline the value directly in <v> as text with t="str")
+  xml = xml.replace(
+    /<c([^>]*?)t="str"([^>]*)><v>\{\{([^}]+)\}\}<\/v><\/c>/g,
+    (match, pre, post, key) => {
+      if (!(key in values)) return match;
+      const num = toNumeric(values[key]);
+      if (num !== null) {
+        return `<c${pre}${post}><v>${num}</v></c>`;
+      }
+      return `<c${pre}t="str"${post}><v>${escapeXml(values[key])}</v></c>`;
+    }
+  );
+
+  // Any remaining placeholders in the sheet XML (e.g. in inline text or other spots)
+  return replacePlaceholders(xml, values);
 }
 
 function replacePlaceholders(text, values) {
