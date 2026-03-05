@@ -895,18 +895,17 @@ function mergeDocxXml(xml, values) {
       key in values ? escapeXml(String(values[key])) : m
     );
 
-    // Use the first <w:r> run as a formatting template
-    const firstRunMatch = para.match(/(<w:r[ >])([\s\S]*?)<\/w:r>/);
+    // Extract rPr formatting from the first run
+    const firstRunMatch = para.match(/<w:r[ >][\s\S]*?<\/w:r>/);
     if (!firstRunMatch) return para;
 
-    // Extract run properties from the first run
-    const rPrMatch = firstRunMatch[2].match(/(<w:rPr[\s\S]*?<\/w:rPr>)/);
+    const rPrMatch = firstRunMatch[0].match(/(<w:rPr[\s\S]*?<\/w:rPr>)/);
     const rPr = rPrMatch ? rPrMatch[1] : '';
 
-    // Build a single replacement run with the full replaced text
+    // Build a clean replacement run (no rsid attributes needed on <w:r>)
     const needsSpace = replaced !== replaced.trim();
     const spaceAttr = needsSpace ? ' xml:space="preserve"' : '';
-    const newRun = `${firstRunMatch[1]}${rPr}<w:t${spaceAttr}>${replaced}</w:t></w:r>`;
+    const newRun = `<w:r>${rPr}<w:t${spaceAttr}>${replaced}</w:t></w:r>`;
 
     // Swap all <w:r> blocks: first gets the new content, rest are deleted
     let inserted = false;
