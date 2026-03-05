@@ -861,62 +861,129 @@ function toNumeric(str) {
   return isFinite(n) ? n : null;
 }
 
+// Extract all <si> text content from sharedStrings.xml as an array
+function parseSharedStrings(xml) {
+  const strings = [];
+  const siRe = /<si>([\s\S]*?)<\/si>/g;
+  const tRe  = /<t[^>]*>([^<]*)<\/t>/g;
+  let si;
+  while ((si = siRe.exec(xml)) !== null) {
+    let text = '';
+    let t;
+    tRe.lastIndex = 0;
+    const inner = si[1];
+    while ((t = tRe.exec(inner)) !== null) text += t[1];
+    strings.push(text);
+  }
+  return strings;
+}
+
 async function mergeXlsx(buffer, values) {
   const zip = await JSZip.loadAsync(buffer);
 
-  // Build a numeric-aware values map
-  // For shared strings we always use text; for inline sheet cells we try numeric
+  // 1. Parse shared strings to build index → text map
+  let sharedStrings = [];
+  // Track which shared string indices are pure placeholders mapping to numbers
+  // so we can rewrite those cells as numeric in the sheet XML
+  const numericSsIdx = {}; // index -> numeric value  (for cells to rewrite as numbers)
+  const textSsIdx    = {}; // index -> string value   (for cells to keep as strings)
+
   const ssFile = zip.file('xl/sharedStrings.xml');
   if (ssFile) {
-    // Shared strings are always text — just replace as text
-    const xml = await ssFile.async('string');
-    zip.file('xl/sharedStrings.xml', replacePlaceholders(xml, values));
+    let ssXml = await ssFile.async('string');
+    sharedStrings = parseSharedStrings(ssXml);
+
+    sharedStrings.forEach((text, idx) => {
+      // Check if this shared string is a pure placeholder (the whole string is {{key}})
+      const m = text.match(/^\{\{([^}]+)\}\}$/);
+      if (m && m[1] in values) {
+        const num = toNumeric(values[m[1]]);
+        if (num !== null) {
+          numericSsIdx[idx] = num;
+        } else {
+          textSsIdx[idx] = values[m[1]];
+        }
+      }
+    });
+
+    // Replace placeholders in shared strings (for text values and mixed strings)
+    ssXml = replacePlaceholders(ssXml, values);
+    zip.file('xl/sharedStrings.xml', ssXml);
   }
 
-  // For worksheet XML, replace placeholder cells with proper numeric cells where possible
+  // 2. Process worksheet XML — rewrite numeric/text shared-string cells
   for (const fname of Object.keys(zip.files)) {
     if (fname.match(/xl\/worksheets\/sheet\d+\.xml/)) {
       let xml = await zip.file(fname).async('string');
-      xml = replaceXlsxCells(xml, values);
+      xml = rewriteSharedStringCells(xml, numericSsIdx, textSsIdx);
+      // Also handle inlineStr and t="str" cells
+      xml = replaceInlineCells(xml, values);
       zip.file(fname, xml);
     }
   }
   return zip.generateAsync({type:'arraybuffer'});
 }
 
-// Replace placeholders in worksheet XML.
-// If a cell contains ONLY a placeholder and the value is numeric,
-// rewrite the cell as a proper number cell (no t="s" or t="inlineStr").
-function replaceXlsxCells(xml, values) {
-  // Handle inline string cells: <c r="A1" t="inlineStr"><is><t>{{key}}</t></is></c>
+// Rewrite shared-string cells (t="s") where the string index maps to a
+// numeric or plain-text replacement, converting them to proper value cells
+function rewriteSharedStringCells(xml, numericIdx, textIdx) {
+  // Match cells with t="s": <c r="B2" s="4" t="s"><v>3</v></c>
+  return xml.replace(
+    /<c([^>]*?)t="s"([^>]*)><v>(\d+)<\/v><\/c>/g,
+    (match, pre, post, idxStr) => {
+      const idx = parseInt(idxStr, 10);
+      if (idx in numericIdx) {
+        // Remove t="s", keep style (s="N") if present, insert numeric value
+        const styleMatch = (pre + post).match(/s="([^"]+)"/);
+        const style = styleMatch ? ` s="${styleMatch[1]}"` : '';
+        const ref   = (pre + post).match(/r="([^"]+)"/);
+        const rAttr = ref ? ` r="${ref[1]}"` : '';
+        return `<c${rAttr}${style}><v>${numericIdx[idx]}</v></c>`;
+      }
+      if (idx in textIdx) {
+        // Keep as string cell but with inline value instead of shared string ref
+        const styleMatch = (pre + post).match(/s="([^"]+)"/);
+        const style = styleMatch ? ` s="${styleMatch[1]}"` : '';
+        const ref   = (pre + post).match(/r="([^"]+)"/);
+        const rAttr = ref ? ` r="${ref[1]}"` : '';
+        return `<c${rAttr}${style} t="inlineStr"><is><t>${escapeXml(textIdx[idx])}</t></is></c>`;
+      }
+      return match;
+    }
+  );
+}
+
+// Handle inlineStr and t="str" cells with placeholders
+function replaceInlineCells(xml, values) {
+  // inlineStr: <c ... t="inlineStr"><is><t>{{key}}</t></is></c>
   xml = xml.replace(
     /<c([^>]*?)t="inlineStr"([^>]*)><is><t>\{\{([^}]+)\}\}<\/t><\/is><\/c>/g,
     (match, pre, post, key) => {
       if (!(key in values)) return match;
       const num = toNumeric(values[key]);
-      if (num !== null) {
-        return `<c${pre}${post}><v>${num}</v></c>`;
-      }
-      return `<c${pre}t="inlineStr"${post}><is><t>${escapeXml(values[key])}</t></is></c>`;
+      const styleMatch = (pre + post).match(/s="([^"]+)"/);
+      const style = styleMatch ? ` s="${styleMatch[1]}"` : '';
+      const ref   = (pre + post).match(/r="([^"]+)"/);
+      const rAttr = ref ? ` r="${ref[1]}"` : '';
+      if (num !== null) return `<c${rAttr}${style}><v>${num}</v></c>`;
+      return `<c${rAttr}${style} t="inlineStr"><is><t>${escapeXml(values[key])}</t></is></c>`;
     }
   );
-
-  // Handle shared-string cells that somehow still have placeholder text inline
-  // (some Excel files inline the value directly in <v> as text with t="str")
+  // t="str": <c ... t="str"><v>{{key}}</v></c>
   xml = xml.replace(
     /<c([^>]*?)t="str"([^>]*)><v>\{\{([^}]+)\}\}<\/v><\/c>/g,
     (match, pre, post, key) => {
       if (!(key in values)) return match;
       const num = toNumeric(values[key]);
-      if (num !== null) {
-        return `<c${pre}${post}><v>${num}</v></c>`;
-      }
-      return `<c${pre}t="str"${post}><v>${escapeXml(values[key])}</v></c>`;
+      const styleMatch = (pre + post).match(/s="([^"]+)"/);
+      const style = styleMatch ? ` s="${styleMatch[1]}"` : '';
+      const ref   = (pre + post).match(/r="([^"]+)"/);
+      const rAttr = ref ? ` r="${ref[1]}"` : '';
+      if (num !== null) return `<c${rAttr}${style}><v>${num}</v></c>`;
+      return `<c${rAttr}${style} t="str"><v>${escapeXml(values[key])}</v></c>`;
     }
   );
-
-  // Any remaining placeholders in the sheet XML (e.g. in inline text or other spots)
-  return replacePlaceholders(xml, values);
+  return xml;
 }
 
 function replacePlaceholders(text, values) {
